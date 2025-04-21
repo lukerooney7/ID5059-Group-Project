@@ -213,3 +213,175 @@ mae_3  <- mean(abs(y_val - y_pred_3))
 cat("Combo 3 - mtry=9, min.node.size=3:\n")
 cat("RMSE:", round(rmse_3, 3), "\n")
 cat("MAE :", round(mae_3, 3), "\n")
+
+
+
+
+
+
+set.seed(99)
+train_sample <- train_scaled[sample(nrow(train_scaled), size = 0.04 * nrow(train_scaled)), ]
+
+train_index <- sample(seq_len(nrow(train_sample)), size = 0.8 * nrow(train_sample))
+train_subset <- train_sample[train_index, ]
+val_subset   <- train_sample[-train_index, ]
+
+
+feature_cols <- c(
+  "tp", "sp", "wind10_speed", "wind100_speed",
+  "hour_sin", "hour_cos",
+  "month_sin", "month_cos",
+  "dow_sin", "dow_cos",
+  "wind10_dir_sin", "wind10_dir_cos",
+  "ptype_grouped_none", "ptype_grouped_rain", "ptype_grouped_other"
+)
+
+X_train <- train_subset[, feature_cols]
+X_val   <- val_subset[, feature_cols]
+
+y_train <- train_subset$t2m
+y_val   <- val_subset$t2m
+
+
+X_train_scaled <- scale(as.matrix(X_train))
+X_val_scaled <- scale(
+  as.matrix(X_val),
+  center = attr(X_train_scaled, "scaled:center"),
+  scale  = attr(X_train_scaled, "scaled:scale")
+)
+
+
+library(glmnet)
+
+sgd_model <- glmnet(
+  x = X_train_scaled,
+  y = y_train,
+  alpha = 0,       # Ridge-style (same as default SGDRegressor)
+  lambda = 0,      # No regularization
+  standardize = FALSE
+)
+
+
+y_pred <- predict(sgd_model, newx = X_val_scaled)
+
+rmse <- sqrt(mean((y_val - y_pred)^2))
+mae  <- mean(abs(y_val - y_pred))
+
+cat("SGD Linear Model Evaluation:\n")
+cat("RMSE:", round(rmse, 3), "\n")
+cat("MAE :", round(mae, 3), "\n")
+
+
+install.packages("xgboost")
+library(xgboost)
+
+
+dtrain <- xgb.DMatrix(data = as.matrix(X_train), label = y_train)
+dval   <- xgb.DMatrix(data = as.matrix(X_val), label = y_val)
+
+
+library(xgboost)
+
+set.seed(99)
+
+xgb_model <- xgboost(
+  data = dtrain,
+  objective = "reg:squarederror",
+  eval_metric = "rmse",
+  nrounds = 100,
+  eta = 0.1,
+  max_depth = 6,
+  subsample = 0.8,
+  colsample_bytree = 0.8,
+  verbose = 0
+)
+
+
+y_pred <- predict(xgb_model, newdata = dval)
+
+rmse <- sqrt(mean((y_val - y_pred)^2))
+mae  <- mean(abs(y_val - y_pred))
+
+cat("XGBoost Model Evaluation:\n")
+cat("RMSE:", round(rmse, 3), "\n")
+cat("MAE :", round(mae, 3), "\n")
+
+
+
+# Define tuning grid
+params_grid <- expand.grid(
+  max_depth = c(4, 6),
+  eta = c(0.1, 0.05),
+  subsample = c(0.8, 1.0)
+)
+
+# Store results
+results <- data.frame()
+
+# Loop over combinations
+for (i in 1:nrow(params_grid)) {
+  cat("Fitting combo", i, "of", nrow(params_grid), "...\n")
+  
+  param <- list(
+    objective = "reg:squarederror",
+    eval_metric = "rmse",
+    max_depth = params_grid$max_depth[i],
+    eta = params_grid$eta[i],
+    subsample = params_grid$subsample[i],
+    colsample_bytree = 0.8
+  )
+  
+  set.seed(99)
+  xgb_tuned <- xgb.train(
+    params = param,
+    data = dtrain,
+    nrounds = 100,
+    verbose = 0
+  )
+  
+  y_pred <- predict(xgb_tuned, newdata = dval)
+  rmse <- sqrt(mean((y_val - y_pred)^2))
+  mae  <- mean(abs(y_val - y_pred))
+  
+  results <- rbind(results, data.frame(
+    max_depth = param$max_depth,
+    eta = param$eta,
+    subsample = param$subsample,
+    rmse = rmse,
+    mae = mae
+  ))
+}
+
+# Print sorted results
+cat("\n Tuning Results (Sorted by RMSE):\n")
+print(results[order(results$rmse), ])
+
+
+
+best_params <- list(
+  objective = "reg:squarederror",
+  eval_metric = "rmse",
+  max_depth = 6,
+  eta = 0.1,
+  subsample = 1.0,
+  colsample_bytree = 0.8
+)
+
+set.seed(99)
+xgb_best <- xgb.train(
+  params = best_params,
+  data = dtrain,
+  nrounds = 300,
+  verbose = 0
+)
+
+y_pred_best <- predict(xgb_best, newdata = dval)
+
+rmse_best <- sqrt(mean((y_val - y_pred_best)^2))
+mae_best  <- mean(abs(y_val - y_pred_best))
+
+cat("Final XGBoost Model (300 rounds):\n")
+cat("RMSE:", round(rmse_best, 3), "\n")
+cat("MAE :", round(mae_best, 3), "\n")
+
+
