@@ -1,0 +1,356 @@
+---
+title: "CW2"
+output: pdf_document
+date: "2025-04-08"
+---
+
+## Introduction
+
+This project focuses on developing predictive models to estimate near-surface air temperature (`t2m`) using a large-scale meteorological dataset. The main goal is to explore how different machine learning approaches perform when applied to spatio-temporal weather data, and to evaluate their effectiveness in capturing temperature variation across time and location.
+
+To approach this task, we apply a consistent preprocessing pipeline and train a range of supervised learning models. Specifically, we fit, tune and assess the performance of the following regression models:
+
+- Decision Tree Regressor  
+- Bagging ensemble of decision trees  
+- Random Forest  
+- Neural Network
+
+Each model is evaluated using metrics such as Root Mean Squared Error (RMSE) and Mean Absolute Error (MAE), allowing for a comparative analysis of their predictive accuracy. This document outlines the preprocessing steps, modeling approaches, and evaluation results that contribute to selecting the most suitable method for the temperature prediction task.
+
+## Dataset description?
+
+The dataset used in this project comes from the ERA5 reanalysis dataset, provided by the European Centre for Medium-Range Weather Forecasts (ECMWF). It includes hourly weather observations for the years 2018 and 2019, covering a grid of latitude and longitude points approximately spanning the United Kingdom.
+
+Each record in the dataset corresponds to a unique combination of time and location, and contains various meteorological variables such as:
+	•	t2m – Temperature at 2 meters above ground (in Kelvin), the target variable for prediction
+	•	tp – Total precipitation
+	•	sp – Surface pressure
+	•	u10, v10 – Wind components at 10 meters (east-west and north-south)
+	•	u100, v100 – Wind components at 100 meters
+	•	tcc – Total cloud cover
+	•	ptype – Precipitation type (e.g., rain, snow)
+
+The dataset exhibits strong temporal patterns (e.g., daily and seasonal cycles) and spatial structure (via latitude and longitude), making it well-suited for predictive modeling that considers both time and location. It contains over 13 million rows in both the training and test sets, making computational efficiency an important consideration throughout the analysis.
+
+```{r setup2, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,        
+  warning = FALSE,    
+  message = FALSE     
+)
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.width = 6,   # default is 7
+  fig.height = 5   # default is 5
+)
+```
+
+
+```{r setup3, include=FALSE}
+train <- read.csv("train.csv")
+install.packages("ggplot2")
+install.packages("tidyr")
+install.packages("dplyr")
+install.packages("fastDummies")
+install.packages("lubridate")
+install.packages("ranger")
+```
+
+## Structure and summary
+```{r de1}
+# Structure and summary
+str(train)
+summary(train)
+```
+
+## NAs?
+```{r de2}
+colSums(is.na(train))
+```
+
+## Distributions
+```{r de3}
+library(ggplot2)
+library(tidyr)
+library(dplyr)
+
+# Select numeric variables
+numeric_vars <- train %>%
+  select(where(is.numeric)) %>%
+  names()
+
+# Plot distributions 
+for (var in numeric_vars) {
+  print(
+    ggplot(train, aes(x = .data[[var]])) +
+      geom_histogram(bins = 50, fill = "steelblue", color = "black", alpha = 0.7) +
+      labs(title = paste("Distribution of", var), x = var, y = "Frequency") +
+      theme_minimal()
+  )
+}
+```
+
+## ID
+The id column is removed because it is simply a unique identifier and carries no predictive value. Keeping it could introduce noise or misleading patterns into the model
+```{r id removal}
+# Drop the 'id' column
+train$id <- NULL
+```
+
+## Date
+We extract hour, month, and dayofweek from valid_time to capture temporal patterns in temperature. These features help the model learn daily and seasonal cycles in the data
+```{r time}
+library(lubridate)
+library(dplyr)
+
+# Convert to datetime format
+train$valid_time <- ymd_hms(train$valid_time)
+
+# Extract time-based features
+train$hour <- hour(train$valid_time)
+train$month <- month(train$valid_time)
+train$dayofweek <- wday(train$valid_time, label = FALSE) - 1  # Make it 0 = Monday
+
+# Fix Sunday wraparound (wday returns 1 = Sunday by default)
+train$dayofweek[train$dayofweek == -1] <- 6
+
+# Display some examples
+train %>%
+  select(valid_time, hour, month, dayofweek) %>%
+  sample_n(10)
+```
+## Ptype
+
+The ptype variable is grouped into simplified categories (none, rain, other) to reduce sparsity, then one-hot encoded to make it suitable for machine learning models
+```{r ptype}
+library(dplyr)
+library(fastDummies)
+
+# Group and encode
+train$ptype_grouped <- case_when(
+  train$ptype == 0 ~ "none",
+  train$ptype == 1 ~ "rain",
+  TRUE             ~ "other"
+)
+
+train <- dummy_cols(
+  train,
+  select_columns = "ptype_grouped",
+  remove_selected_columns = TRUE,   
+  remove_first_dummy = FALSE
+)
+```
+
+
+Check new ptype distribution
+```{r new ptype distribution}
+# Sum the one-hot columns to see category counts
+ptype_distribution <- train %>%
+  summarise(
+    none  = sum(ptype_grouped_none),
+    rain  = sum(ptype_grouped_rain),
+    other = sum(ptype_grouped_other)
+  )
+
+print(ptype_distribution)
+```
+
+
+## Wind transformation
+```{r wind}
+# Calculate wind speeds
+train$wind10_speed  <- sqrt(train$u10^2 + train$v10^2)
+train$wind100_speed <- sqrt(train$u100^2 + train$v100^2)
+```
+
+```{r wind2}
+# Wind direction (0° = North, 90° = East)
+train$wind10_dir  <- (atan2(train$u10,  train$v10)  * 180 / pi) %% 360
+train$wind100_dir <- (atan2(train$u100, train$v100) * 180 / pi) %% 360
+
+# Convert to radians
+train$wind10_dir_rad  <- train$wind10_dir  * pi / 180
+train$wind100_dir_rad <- train$wind100_dir * pi / 180
+
+# Sine and cosine components
+train$wind10_dir_sin  <- sin(train$wind10_dir_rad)
+train$wind10_dir_cos  <- cos(train$wind10_dir_rad)
+
+train$wind100_dir_sin <- sin(train$wind100_dir_rad)
+train$wind100_dir_cos <- cos(train$wind100_dir_rad)
+
+```
+
+
+## Standarization
+
+Selected numeric features are standardized to have a mean of 0 and standard deviation of 1. This ensures that features on different scales contribute equally to the model, especially for distance-based or regularized algorithms
+```{r scaling}
+# List of features to scale
+features_to_scale <- c(
+  "tp", "sp", "wind10_speed", "wind100_speed",
+  "hour", "month", "dayofweek"
+)
+
+# Create a copy to preserve the original dataset
+train_scaled <- train
+
+# Apply standard scaling (mean = 0, sd = 1)
+train_scaled[features_to_scale] <- scale(train_scaled[features_to_scale])
+
+# Display scaled values to confirm
+head(train_scaled[features_to_scale])
+```
+
+## Time sin-cos transformation
+
+Time features like hour, month, and dayofweek are cyclical (e.g., 23:00 is close to 00:00), so we transform them using sine and cosine functions. This captures their natural circular patterns and allows the model to learn transitions more smoothly (e.g., midnight to early morning). Without this encoding, the model might incorrectly interpret 0 and 23 as being far apart.
+```{r time sin cos}
+# Encode 'hour' as cyclical
+train_scaled$hour_sin <- sin(2 * pi * train_scaled$hour / 24)
+train_scaled$hour_cos <- cos(2 * pi * train_scaled$hour / 24)
+
+# Encode 'month' as cyclical
+train_scaled$month_sin <- sin(2 * pi * train_scaled$month / 12)
+train_scaled$month_cos <- cos(2 * pi * train_scaled$month / 12)
+
+# Encode 'dayofweek' as cyclical (0 = Monday, 6 = Sunday)
+train_scaled$dow_sin <- sin(2 * pi * train_scaled$dayofweek / 7)
+train_scaled$dow_cos <- cos(2 * pi * train_scaled$dayofweek / 7)
+
+library(dplyr)
+
+train_scaled %>%
+  select(hour, hour_sin, hour_cos, month, month_sin, month_cos) %>%
+  sample_n(10)
+```
+
+## x and y
+```{r define}
+# Define the target variable 
+y <- train_scaled$t2m  
+
+# Define input features 
+feature_cols <- c(
+  "tp", "sp", "wind10_speed", "wind100_speed",
+  "hour_sin", "hour_cos",
+  "month_sin", "month_cos",
+  "wind10_dir_sin", "wind10_dir_cos",
+  "ptype_grouped_none", "ptype_grouped_rain", "ptype_grouped_other"
+)
+
+# Create feature matrix
+X <- train_scaled[, feature_cols]
+
+# Print shape
+cat(" Features and target selected.\n")
+cat("Feature matrix dimensions:", nrow(X), "rows ×", ncol(X), "columns\n")
+```
+
+## 4% sample, and 80-20 split
+```{r wrangled dataset}
+library(dplyr)
+
+set.seed(42)
+train_scaled %>% sample_n(5)
+```
+```{r sample}
+set.seed(99)
+
+# Step 1: Sample 4% of the full dataset
+train_sample <- train_scaled[sample(nrow(train_scaled), size = 0.04 * nrow(train_scaled)), ]
+
+# Step 2: Split into 80% training and 20% validation
+train_index <- sample(seq_len(nrow(train_sample)), size = 0.8 * nrow(train_sample))
+
+train_subset <- train_sample[train_index, ]
+val_subset   <- train_sample[-train_index, ]
+
+# Confirm dimensions
+cat(" Sampled dataset size:", nrow(train_sample), "\n")
+cat(" Training set size   :", nrow(train_subset), "\n")
+cat(" Validation set size :", nrow(val_subset), "\n")
+```
+
+
+## Random forest
+
+A Random Forest model is trained using 4% of the dataset with 500 trees. The model uses 7 features at each split (mtry = 7) and a minimum node size of 10. Predictions are made on a held-out validation set, and performance is evaluated using RMSE and MAE. This model balances predictive power with interpretability and is well-suited to handle non-linear relationships in the data
+```{r rf, eval=FALSE, echo=TRUE}
+# Load the ranger package
+library(ranger)
+
+# Fit the Random Forest model
+rf_model <- ranger(
+  formula = t2m ~ .,              
+  data = train_subset,            
+  num.trees = 500,                  
+  mtry = 7,                         
+  min.node.size = 10,             
+  importance = "impurity",         
+  seed = 99                         
+)
+
+# Predict on the validation set
+y_val <- val_subset$t2m
+X_val <- val_subset[, !(names(val_subset) %in% c("t2m"))]
+
+y_pred <- predict(rf_model, data = X_val)$predictions
+
+# Evaluate
+rmse <- sqrt(mean((y_val - y_pred)^2))
+mae  <- mean(abs(y_val - y_pred))
+
+# Print results
+cat(" Random Forest Evaluation (4% Sample):\n")
+cat("RMSE:", round(rmse, 3), "\n")
+cat("MAE :", round(mae, 3), "\n")
+```
+
+RMSE: 0.876
+MAE : 0.6 
+(R crashes when knitting)
+
+
+```{r rf-tuned, echo=TRUE, eval=FALSE}
+library(ranger)
+
+# Fit the model with a tuned configuration
+rf_model <- ranger(
+  formula = t2m ~ .,
+  data = train_subset,
+  num.trees = 800,        # More trees for better generalization
+  mtry = 9,               # Slightly higher than best so far
+  min.node.size = 5,      # Smaller leaves for more complexity
+  importance = "impurity",
+  seed = 99
+)
+
+# Predict and evaluate
+y_val <- val_subset$t2m
+X_val <- val_subset[, !(names(val_subset) %in% "t2m")]
+
+y_pred <- predict(rf_model, data = X_val)$predictions
+
+# Metrics
+rmse <- sqrt(mean((y_val - y_pred)^2))
+mae  <- mean(abs(y_val - y_pred))
+
+# Output
+cat(" Tuned Random Forest:\n")
+cat("RMSE:", round(rmse, 3), "\n")
+cat("MAE :", round(mae, 3), "\n")
+```
+
+RMSE: 0.817 
+MAE : 0.554 
+(R crashed when knitting)
+
+
+
+
